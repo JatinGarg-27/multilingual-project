@@ -21,6 +21,8 @@ services:
     env_file: ./services/tts_service/.env
     ports:
       - "8002:8002"
+    volumes:
+      - tts_audio:/app/audio_output
 
   content-service:
     build: ./services/content_service
@@ -34,3 +36,4 @@ services:
 
 volumes:
   db_data:
+  tts_audio:

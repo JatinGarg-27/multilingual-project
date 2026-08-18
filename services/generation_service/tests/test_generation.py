@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -26,3 +28,42 @@ def test_refine_returns_stub_when_unconfigured():
     body = response.json()
     assert "make it shorter" in body["output"]
     assert "hello world" in body["output"]
+
+
+def _fake_openai_response(content: str) -> MagicMock:
+    fake = MagicMock()
+    fake.raise_for_status.return_value = None
+    fake.json.return_value = {"choices": [{"message": {"content": content}}]}
+    return fake
+
+
+def test_generate_calls_openai_with_correct_request_when_configured():
+    with patch("app.main.settings") as mock_settings, patch("httpx.post") as mock_post:
+        mock_settings.openai_api_key = "sk-test"
+        mock_settings.openai_base_url = "https://api.openai.com/v1/chat/completions"
+        mock_settings.openai_model = "gpt-4o-mini"
+        mock_post.return_value = _fake_openai_response("A generated haiku")
+
+        response = client.post("/generate", json={"prompt": "Write a haiku"})
+
+        assert response.status_code == 200
+        assert response.json()["output"] == "A generated haiku"
+
+        call = mock_post.call_args
+        assert call.args[0] == "https://api.openai.com/v1/chat/completions"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer sk-test"
+        assert call.kwargs["json"]["model"] == "gpt-4o-mini"
+        assert call.kwargs["json"]["messages"] == [{"role": "user", "content": "Write a haiku"}]
+
+
+def test_generate_returns_502_when_openai_unreachable():
+    with patch("app.main.settings") as mock_settings, patch("httpx.post") as mock_post:
+        mock_settings.openai_api_key = "sk-test"
+        mock_settings.openai_base_url = "https://api.openai.com/v1/chat/completions"
+        mock_settings.openai_model = "gpt-4o-mini"
+        import httpx
+
+        mock_post.side_effect = httpx.ConnectError("connection refused")
+
+        response = client.post("/generate", json={"prompt": "hi"})
+        assert response.status_code == 502

@@ -631,3 +631,162 @@ Not applicable — no changes were made, only verification.
 > The previous implementation had this marked as an explicit open risk in two prior decision entries, since no Docker was available to the AI itself.  
 > The new state is that the schema is now confirmed to work against real Postgres, not just offline-generated SQL.  
 > This was recorded as its own entry rather than silently editing DECISION-001/002's Result sections because this file's chronological, append-only convention means new evidence gets a new entry, not a rewrite of what was known at the time.
+
+---
+
+## DECISION-004 — Wire real LLM (OpenAI) and TTS (ElevenLabs) providers
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Type:** Feature
+
+### 1. Trigger
+
+User asked to complete the real LLM/TTS integration (previously left as a provider-agnostic stub per DECISION-001, at the user's own instruction to "stick to the description" and not invent a vendor). Asked which providers to use; user chose OpenAI (LLM) and ElevenLabs (TTS) from the options presented.
+
+### 2. Problem
+
+`generation_service` and `tts_service` only ever returned stub text/audio — `_call_llm`/`_call_elevenlabs`-equivalent code called a generic `{base_url}` with a guessed request/response shape (`{"model","prompt"} -> {"output"}` and `{"text","language","voice_id"} -> {"audio_url"}`), which does not match any real provider's actual API contract. Bullet 2 of the resume ("Integrating an LLM API to draft and refine content, paired with a TTS API...") was architecturally true but not functionally true — no real AI-generated content or audio was ever produced.
+
+### 3. Previous Implementation
+
+```text
+generation_service/app/main.py:
+  _call_llm(prompt) -> httpx.post(LLM_API_BASE_URL, json={"model","prompt"}) -> response.json()["output"]
+
+tts_service/app/main.py:
+  synthesize() -> httpx.post(TTS_API_BASE_URL, json={"text","language","voice_id"}) -> response.json()["audio_url"]
+```
+Neither shape matches a real provider. No audio storage existed — the (fictional) contract assumed the provider returned a ready-made URL.
+
+### 4. Decision
+
+- `generation_service`: rewrote to call OpenAI's real Chat Completions API — `POST https://api.openai.com/v1/chat/completions`, `Authorization: Bearer {OPENAI_API_KEY}`, body `{"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}]}`, parses `response.json()["choices"][0]["message"]["content"]`. Config renamed `LLM_API_*` → `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL` (default `gpt-4o-mini`).
+- `tts_service`: rewrote to call ElevenLabs' real text-to-speech API — `POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`, `xi-api-key: {ELEVENLABS_API_KEY}` header (not `Authorization: Bearer` — ElevenLabs uses its own header), body `{"text", "model_id": "eleven_multilingual_v2"}`. ElevenLabs returns raw MP3 bytes, not JSON/a URL, so the service now writes the bytes to `audio_output/{uuid}.mp3` and serves them back via a new `StaticFiles` mount at `/audio`, returning `{PUBLIC_BASE_URL}/audio/{uuid}.mp3` as `audio_url`. Config renamed `TTS_API_*` → `ELEVENLABS_API_KEY`/`ELEVENLABS_BASE_URL`/`ELEVENLABS_MODEL_ID`/`DEFAULT_VOICE_ID`/`PUBLIC_BASE_URL`.
+- Both services now return `502` (not an unhandled exception → generic 500) when the provider errors or is unreachable, via explicit `httpx.HTTPStatusError`/`httpx.RequestError` handling.
+- `docker-compose.yml`: added a named volume (`tts_audio`) mounted at `/app/audio_output` in `tts-service`, so generated audio survives container restarts.
+- Both services' `.env.example` updated with real signup URLs and the actual env var names.
+- **Known gap, not hidden:** ElevenLabs' `eleven_multilingual_v2` model does not officially list Telugu or Kannada as supported languages (Tamil is supported). The system still accepts and forwards `te`/`kn` requests (our own `supported_languages` list is unchanged, since the resume/architecture claims all three Indian languages), but output quality/accuracy for those two is not guaranteed by the provider. This is documented in `tts_service/app/config.py`, `.env.example`, `CLAUDE.md`, and `README.md`.
+
+### 5. Why This Decision?
+
+- User directly chose OpenAI and ElevenLabs when asked; no ambiguity to resolve.
+- ElevenLabs was already the AI's own earlier recommendation specifically because it covers more of the six required languages than alternatives — but "more" turned out not to mean "all three" Indian languages, which only became clear while implementing the real request format. Silently ignoring that gap would violate this file's own rule against overclaiming; documenting it lets the user decide whether to accept it, add a second provider for `te`/`kn` later, or note it as a known limitation in interviews.
+- Storing audio to local disk + serving via a static mount is the minimal real implementation of "audio_url" that doesn't require standing up S3/cloud storage for a portfolio project, while still being a genuine file a client can play, not a fake stub string.
+
+### 6. Alternatives Considered
+
+#### Alternative A
+
+**Approach:**  
+Keep the LLM/TTS layer fully generic/provider-agnostic indefinitely, never calling a real API.
+
+**Why rejected:**  
+User explicitly asked to complete the real integration now — the resume bullet claims working LLM+TTS integration, and a stub-only implementation can't back that claim in a live demo.
+
+#### Alternative B
+
+**Approach:**  
+For TTS, reject `te`/`kn` outright with a 400 (matching what ElevenLabs actually supports) instead of accepting-but-not-guaranteeing them.
+
+**Why rejected:**  
+The resume and the project's own `supported_languages` config explicitly claim all three Indian languages. Silently narrowing that without telling the user would be a bigger integrity problem than documenting the gap. Left the decision of whether to actually drop `te`/`kn` support (or add a second TTS provider for them) to the user.
+
+### 7. Files Modified
+
+| File | Change | Reason |
+|---|---|---|
+| `services/generation_service/app/config.py` | `LLM_API_*` → `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL` | Match real OpenAI env var naming |
+| `services/generation_service/app/main.py` | Real OpenAI Chat Completions request/response handling, 502 on provider error | Was a fictional generic contract |
+| `services/generation_service/.env.example` | Real key names + signup URL | Match new config |
+| `services/generation_service/tests/test_generation.py` | Added 2 tests mocking `httpx.post` to verify request construction (URL, headers, body) and 502 handling | Prove the request-building logic is correct without a real key |
+| `services/tts_service/app/config.py` | `TTS_API_*` → `ELEVENLABS_API_KEY`/`ELEVENLABS_BASE_URL`/`ELEVENLABS_MODEL_ID`/`DEFAULT_VOICE_ID`/`PUBLIC_BASE_URL`; added `unverified_languages` | Match real ElevenLabs env vars; flag the te/kn gap in code |
+| `services/tts_service/app/main.py` | Real ElevenLabs call, writes returned bytes to `audio_output/`, `StaticFiles` mount at `/audio`, 502 on provider error | ElevenLabs returns raw audio bytes, not a JSON URL — previous contract was fictional |
+| `services/tts_service/.env.example` | Real key names, signup URL, te/kn caveat | Match new config |
+| `services/tts_service/tests/test_tts.py` | Added 2 tests mocking `httpx.post`, verifying request construction and that bytes get written+served correctly via the `/audio` mount | Prove the file-storage/serving logic is correct without a real key |
+| `docker-compose.yml` | Added `tts_audio` named volume mounted at `/app/audio_output` in `tts-service` | Generated audio should survive container restarts |
+| `.gitignore` (root) | Added `audio_output/` | Generated files shouldn't be committed |
+| `CLAUDE.md`, `README.md` | Name the real providers, document the te/kn gap | Match actual implementation |
+
+### 8. Dependencies / Configuration
+
+```text
+Added:
+- (none — httpx was already a dependency of both services; StaticFiles
+  ships with FastAPI/Starlette, no new package needed)
+
+Removed:
+- (none)
+
+Environment variables:
+- generation_service: removed LLM_API_BASE_URL/LLM_API_KEY/LLM_MODEL;
+  added OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+- tts_service: removed TTS_API_BASE_URL/TTS_API_KEY; added
+  ELEVENLABS_API_KEY, ELEVENLABS_BASE_URL, ELEVENLABS_MODEL_ID,
+  DEFAULT_VOICE_ID, PUBLIC_BASE_URL
+
+Configuration:
+- docker-compose.yml: added tts_audio named volume for tts-service
+```
+
+### 9. Result
+
+```text
+Test:
+Ran the full suite for both changed services:
+  services/generation_service: pytest tests/  -> 5 passed
+  services/tts_service:        pytest tests/  -> 8 passed
+  services/content_service:    pytest tests/  -> 5 passed (unaffected,
+    re-ran to confirm — content_service's HTTP clients talk to the
+    same response shape both services still return, unchanged)
+New tests mock httpx.post/response to verify: the exact URL, headers,
+and JSON body sent to the real provider endpoints; correct parsing of
+the response; that a provider error/timeout surfaces as 502 not a
+raw exception; and (TTS) that returned bytes are actually written to
+disk and served back byte-for-byte through the /audio static mount.
+
+Expected:
+All tests pass; request construction matches each provider's
+documented API contract.
+
+Actual:
+All 18 tests passed (5+8+5).
+
+Status:
+PASS for request-construction/response-parsing logic and the file
+storage/serving mechanism — all verified by mocking httpx, since no
+real OPENAI_API_KEY or ELEVENLABS_API_KEY is available in this
+environment.
+NOT YET VERIFIED: an actual live call to OpenAI's or ElevenLabs' real
+API. The AI has no internet-reachable credentials for either provider.
+This can only be confirmed once the user adds a real key to
+services/generation_service/.env and services/tts_service/.env and
+tries it (e.g. through the docker compose stack already running).
+```
+
+### 10. Trade-offs / Risks
+
+- **Unverified against the live APIs** — API contracts, model names (`gpt-4o-mini`, `eleven_multilingual_v2`), and auth header conventions were implemented per documented/known-stable patterns, not confirmed against a real response. If either provider has changed something since, the first real call may need a small fix.
+- **Telugu/Kannada gap** — see above. The resume's claim of covering all three Indian languages is not fully backed by the chosen TTS provider.
+- **Audio storage is local-disk, ephemeral-by-default** — mitigated with a docker volume, but this is not a production-grade asset store (no CDN, no cleanup/retention policy, single-container storage doesn't scale horizontally). Fine for a portfolio project; would need S3/GCS + a CDN for real scale.
+- **`gpt-4o-mini` / `eleven_multilingual_v2` are point-in-time model names** — both providers periodically deprecate/rename models; `OPENAI_MODEL`/`ELEVENLABS_MODEL_ID` are configurable via env so this doesn't require a code change if a model is retired.
+
+### 11. Rollback
+
+```text
+Revert:
+- Restore services/generation_service/app/{main,config}.py and
+  services/tts_service/app/{main,config}.py from the DECISION-003
+  commit (back to generic-provider stub behavior)
+- Restore the corresponding .env.example files
+- Remove the StaticFiles mount / audio_output storage from tts_service
+- Remove the tts_audio volume from docker-compose.yml
+- Revert commit: (see git log after this entry's commit)
+```
+
+### 12. AI Reasoning Summary
+
+> The AI made this change because the user asked to complete the real LLM/TTS integration and chose OpenAI and ElevenLabs when given the choice.  
+> The previous implementation called a fictional generic API contract that no real provider actually implements, so nothing real was ever generated.  
+> The new implementation calls each provider's actual documented API, handles their real response shapes (including ElevenLabs returning raw audio bytes instead of a URL, which required adding local file storage + static serving), and fails cleanly (502) instead of crashing when a provider errors.  
+> This was preferred over staying generic (doesn't satisfy the user's explicit request) or silently picking different providers (the user was asked and chose these two) — and the discovered Telugu/Kannada coverage gap was documented rather than hidden, per this file's own honesty rules, since it directly affects whether the resume's claim is fully accurate.
