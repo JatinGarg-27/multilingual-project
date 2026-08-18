@@ -10,11 +10,25 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
 
-  api:
-    build: .
-    env_file: .env
+  generation-service:
+    build: ./services/generation_service
+    env_file: ./services/generation_service/.env
+    ports:
+      - "8001:8001"
+
+  tts-service:
+    build: ./services/tts_service
+    env_file: ./services/tts_service/.env
+    ports:
+      - "8002:8002"
+
+  content-service:
+    build: ./services/content_service
+    env_file: ./services/content_service/.env
     depends_on:
       - db
+      - generation-service
+      - tts-service
     ports:
       - "8000:8000"
 
