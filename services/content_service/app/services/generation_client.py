@@ -8,7 +8,7 @@ from app.core.config import settings
 
 def _post(path: str, json: dict) -> dict:
     try:
-        response = httpx.post(f"{settings.generation_service_url}{path}", json=json, timeout=30.0)
+        response = httpx.post(f"{settings.generation_service_url}{path}", json=json, timeout=95.0)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(

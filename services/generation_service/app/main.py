@@ -41,7 +41,7 @@ def _call_llm(prompt: str) -> str:
             url,
             params={"key": settings.gemini_api_key},
             json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30.0,
+            timeout=90.0,
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:

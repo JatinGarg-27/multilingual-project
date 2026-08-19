@@ -1208,3 +1208,140 @@ Revert:
 > The previous implementation was correctly integrated but functionally blocked on account billing for both LLM and TTS.  
 > The new implementation uses Google Gemini's genuinely free, no-card tier for LLM, and gTTS's genuinely free, no-account TTS — verified live for TTS (real audio, real languages including the two ElevenLabs couldn't cover) and verified for correctness (not yet live) for LLM, since no Gemini key was available to the AI.  
 > This was preferred over Groq or an ElevenLabs-own-voice workaround (both reasonable, but the user chose Gemini/gTTS when given the choice) because it is the most unambiguously free path for both halves, with the added benefit of genuinely fixing the Telugu/Kannada gap rather than just working around it.
+
+---
+
+## DECISION-008 — Live-verify the free Gemini integration; fix a request timeout and a non-hermetic test bug found in the process
+
+**Date:** 2026-08-19  
+**Status:** Accepted  
+**Type:** Bug Fix
+
+### 1. Trigger
+
+User added a real `GEMINI_API_KEY` and rebuilt the stack. First real call failed with a model-not-found error naming the exact wrong model (`gemini-2.0-flash` deprecated, Google's own error told us to use `gemini-3.6-flash`). After fixing that, calls then failed with "The read operation timed out."
+
+### 2. Problem
+
+Two separate real bugs, found by actually running the integration end-to-end rather than trusting it because the code looked right:
+
+1. `gemini-2.0-flash` (this project's default model name, set in DECISION-007) has been deprecated by Google since this project's knowledge of the Gemini API was written. Google's own 404 response named the replacement directly: `gemini-3.6-flash`.
+2. Even after fixing the model name, real `/generate` calls timed out. Investigated by testing the exact same request from progressively narrower scopes: host machine (fast, proves DNS/TLS/reachability are fine), inside the container with an invalid key (fast 400, proves the container's network path itself is fine for small/fast responses), inside the container with the real key (hung). Retried with a 60-second timeout instead of assuming it was a network black-hole: it completed in **29.5 seconds**. `gemini-3.6-flash` returns extended "thinking" content (visible as a `thoughtSignature` field in the raw response) before its final answer, which simply takes longer to generate than `gpt-4o-mini` did — this was a too-short timeout (30s), not a broken connection.
+3. Fixing that surfaced a third, pre-existing issue while re-running tests: `test_generate_returns_stub_when_unconfigured` and `test_refine_returns_stub_when_unconfigured` started failing (and the suite went from ~1s to 66s). Root cause: pydantic-settings loads `.env` relative to the process's working directory at import time, and pytest's CWD for these tests is `services/generation_service/` — the same directory as the real, git-ignored `.env` file with the user's real key. Once that file had a real key in it, these two tests silently stopped testing the unconfigured path and instead made real, slow, billable-if-it-were-a-paid-provider network calls, without anyone asking them to.
+
+### 3. Previous Implementation
+
+`gemini_model` defaulted to `"gemini-2.0-flash"`. `_call_llm`'s `httpx.post` used `timeout=30.0`, and `content_service`'s `generation_client.py` wrapped that whole call with its own `timeout=30.0`. `test_generate_returns_stub_when_unconfigured`/`test_refine_returns_stub_when_unconfigured` called the endpoint directly with no mocking, implicitly relying on `settings.gemini_api_key` being empty.
+
+### 4. Decision
+
+- Changed the default model to `gemini-3.6-flash` in `generation_service/app/config.py` and `.env.example`, and updated the one test that asserts the exact request URL.
+- Raised `generation_service`'s own request timeout from 30.0s to 90.0s, and `content_service`'s `generation_client.py` timeout (the outer call wrapping generation-service's call to Gemini) from 30.0s to 95.0s, so the outer timeout can't fire before the inner one.
+- Fixed the two stub tests to explicitly patch `app.main.settings` with `gemini_api_key = ""` (and `gemini_model` set to a real string, since patching the whole settings object with a `MagicMock` otherwise made `GenerationOut(model=...)` fail Pydantic validation on a Mock object) — these tests no longer depend on what happens to be in the developer's local `.env` file.
+
+### 5. Why This Decision?
+
+- The model name and timeout were both real, load-bearing bugs blocking the one thing this whole session was building toward — verified with real curl/Python calls at each layer rather than guessed at, specifically to avoid claiming a fix works without testing it (this file's own rule).
+- The non-hermetic test bug matters beyond just "tests are green again": a test suite whose behavior silently depends on a git-ignored local file is not reproducible — it could pass on one machine and fail (or, worse, quietly start making real network calls) on another depending on what's in that file. Explicit mocking is the fix, not coincidence.
+
+### 6. Alternatives Considered
+
+#### Alternative A
+
+**Approach:**  
+Leave the timeout at 30s and treat `gemini-3.6-flash`'s extra latency as a reason to switch back to a faster/older Gemini model.
+
+**Why rejected:**  
+`gemini-3.6-flash` is the model Google's own API is actively steering callers toward (the 404 error said so explicitly) — fighting that by pinning an older, soon-to-be-deprecated model would just recreate this exact bug again later. Raising the timeout is the correct fix for a model that's genuinely a bit slower, not a workaround.
+
+#### Alternative B
+
+**Approach:**  
+Leave the two stub tests as they were and just tell developers "don't run tests from a directory with a populated `.env`."
+
+**Why rejected:**  
+That's not enforceable and isn't how anyone will actually run `pytest tests/` day to day — the correct fix is for the tests themselves to not depend on ambient state, which is a two-line change per test.
+
+### 7. Files Modified
+
+| File | Change | Reason |
+|---|---|---|
+| `services/generation_service/app/config.py` | `gemini_model` default `gemini-2.0-flash` → `gemini-3.6-flash` | Old model deprecated by Google |
+| `services/generation_service/.env.example` | Same rename | Match |
+| `services/generation_service/app/main.py` | `_call_llm`'s httpx timeout 30.0 → 90.0 | Real Gemini calls can legitimately take ~30s |
+| `services/content_service/app/services/generation_client.py` | Outer httpx timeout 30.0 → 95.0 | Must exceed generation-service's own timeout |
+| `services/generation_service/tests/test_generation.py` | Both "unconfigured" tests now explicitly patch `settings.gemini_api_key = ""`; model-name assertion updated to `gemini-3.6-flash` | Tests must not depend on the developer's local `.env` |
+
+### 8. Dependencies / Configuration
+
+```text
+Added: (none)
+Removed: (none)
+Environment variables: user's local GEMINI_MODEL updated from
+  gemini-2.0-flash to gemini-3.6-flash (git-ignored file, not committed)
+Configuration:
+- generation_service internal timeout: 30s → 90s
+- content_service → generation-service timeout: 30s → 95s
+```
+
+### 9. Result
+
+```text
+Test:
+1. pytest, generation_service: 5 passed in 1.11s (previously 66s with
+   2 failures once a real key was present in .env — confirms the fix
+   restores both correctness and speed).
+2. pytest, content_service: 5 passed (unaffected).
+3. Rebuilt content-service and generation-service via docker compose.
+4. curl directly to generation-service :8001/generate with the real
+   key: real Gemini-authored text returned in 7.5s (well under the
+   new 90s timeout).
+5. Full live click-through of the actual /demo page via a real
+   browser: typed "Tell me something interesting about Gen AI",
+   clicked "Draft with AI" -- got back several paragraphs of genuine,
+   coherent Gemini-generated content (verified by reading the page's
+   own textarea value via JS, not assumed). Then selected German and
+   clicked "Convert to speech" -- got "Done — playing below" and a
+   real audio_url.
+
+Expected:
+Real drafted text and real generated speech, produced through the
+actual page a non-technical user would use, with no crashes and no
+timeouts.
+
+Actual:
+Exactly that -- confirmed live, both halves, through the real UI.
+
+Status:
+PASS. Both LLM and TTS are now genuinely, functionally working end to
+end, for free, verified through the actual product surface rather
+than just direct API calls.
+```
+
+### 10. Trade-offs / Risks
+
+- **A real Gemini API key was accidentally displayed in this session's tool output** while debugging container environment variables (an `env | grep` command that wasn't filtered, unlike earlier, more careful key-masking in DECISION-006). The user was told immediately to rotate it at Google AI Studio. Recorded here per this file's own rule against hiding what actually happened, not just what was intended.
+- `gemini-3.6-flash`'s ~7-30s response time (vs. `gpt-4o-mini`'s sub-2s typical response) means a real user of the `/demo` page will wait noticeably longer for a draft than they would have with OpenAI — an inherent trade-off of the free tier's model, not something more timeout-tuning can fix.
+- Model names on both free providers (Gemini here, and gTTS's dependency on Google Translate's stability) are outside this project's control and can change again without notice — this is the second model-name break in as many days of active development.
+
+### 11. Rollback
+
+```text
+Revert:
+- services/generation_service/app/config.py, .env.example: gemini_model
+  back to gemini-2.0-flash (not recommended -- it is actually deprecated)
+- services/generation_service/app/main.py: timeout back to 30.0
+- services/content_service/app/services/generation_client.py: timeout
+  back to 30.0
+- services/generation_service/tests/test_generation.py: revert to
+  unmocked stub tests (not recommended -- reintroduces the non-hermetic
+  test bug)
+- Revert commit: (see git log after this entry's commit)
+```
+
+### 12. AI Reasoning Summary
+
+> The AI made this change because live-testing the newly-added Gemini key surfaced two real, distinct bugs (a deprecated model name, and a too-short timeout for that model's slower response style), plus a latent test-hygiene bug that only became visible once a real key existed locally.  
+> The previous implementation would have looked correct in code review but failed on every real call, and two tests would have silently stopped testing what their names claimed to test.  
+> The new implementation was verified at every layer -- direct provider call, direct service call, and a real browser click-through of the actual demo page -- producing genuine AI-drafted text and genuine synthesized speech.  
+> This was preferred over reverting to an older, deprecated model (recreates the same bug) or leaving the tests ambient-state-dependent (not reproducible) because both fixes address the actual root cause rather than the symptom.
