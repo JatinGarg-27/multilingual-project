@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Content &amp; Speech Demo</title>
+<style>
+  :root {
+    --bg: #f7f7f8;
+    --card: #ffffff;
+    --text: #1a1a1a;
+    --muted: #6b6b6b;
+    --border: #e0e0e0;
+    --accent: #2c3e50;
+    --accent-hover: #1c2833;
+    --error: #b3261e;
+    --success: #0f6e56;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 32px 16px 80px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 4px; }
+  .card .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 14px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  input[type="text"], textarea, select {
+    width: 100%;
+    font-family: inherit;
+    font-size: 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+    color: var(--text);
+  }
+  textarea { resize: vertical; min-height: 90px; }
+  .row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 140px; }
+  button {
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary { background: #eceef0; color: var(--text); }
+  button.secondary:hover:not(:disabled) { background: #dfe2e5; }
+  .status { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .status.error { color: var(--error); }
+  .status.success { color: var(--success); }
+  .status.loading { color: var(--muted); }
+  audio { width: 100%; margin-top: 14px; display: none; }
+  .divider { text-align: center; color: var(--muted); font-size: 12px; margin: 18px 0; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 30px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Content &amp; Speech Demo</h1>
+  <p class="subtitle">Draft content with AI, then hear it spoken back in one of six languages. This runs entirely against the live backend — nothing here is faked.</p>
+
+  <div class="card">
+    <h2>Step 1 — Draft with AI (optional)</h2>
+    <p class="hint">Describe what you want written. Skip this and just type directly into the box below if you'd rather.</p>
+    <label for="prompt">What should the AI write?</label>
+    <input type="text" id="prompt" placeholder="e.g. Announce a new coffee shop opening downtown">
+    <div class="row">
+      <button id="draftBtn">Draft with AI</button>
+    </div>
+    <div id="draftStatus" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h2>Step 2 — Your content</h2>
+    <p class="hint">Edit freely — whatever is in this box is what gets converted to speech.</p>
+    <label for="body">Content</label>
+    <textarea id="body" placeholder="Type or paste text here..."></textarea>
+  </div>
+
+  <div class="card">
+    <h2>Step 3 — Convert to speech</h2>
+    <div class="row">
+      <div>
+        <label for="language">Language</label>
+        <select id="language">
+          <option value="de">German</option>
+          <option value="fr">French</option>
+          <option value="es">Spanish</option>
+          <option value="ta">Tamil</option>
+          <option value="te">Telugu (limited provider support)</option>
+          <option value="kn">Kannada (limited provider support)</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <button id="speakBtn">Convert to speech</button>
+    </div>
+    <div id="speakStatus" class="status"></div>
+    <audio id="player" controls></audio>
+  </div>
+
+  <footer>Talks directly to content-service, which calls generation-service (OpenAI) and tts-service (ElevenLabs) behind the scenes.</footer>
+</div>
+
+<script>
+const API = "/api/v1";
+
+const els = {
+  prompt: document.getElementById("prompt"),
+  body: document.getElementById("body"),
+  language: document.getElementById("language"),
+  draftBtn: document.getElementById("draftBtn"),
+  speakBtn: document.getElementById("speakBtn"),
+  draftStatus: document.getElementById("draftStatus"),
+  speakStatus: document.getElementById("speakStatus"),
+  player: document.getElementById("player"),
+};
+
+function setStatus(el, text, kind) {
+  el.textContent = text || "";
+  el.className = "status" + (kind ? " " + kind : "");
+}
+
+async function api(path, options = {}) {
+  const token = localStorage.getItem("demo_token");
+  const headers = Object.assign(
+    { "Content-Type": "application/json" },
+    token ? { Authorization: "Bearer " + token } : {},
+    options.headers || {}
+  );
+  const res = await fetch(API + path, Object.assign({}, options, { headers }));
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* no body */ }
+  if (!res.ok) {
+    const detail = data && data.detail ? (Array.isArray(data.detail) ? JSON.stringify(data.detail) : data.detail) : res.statusText;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+async function ensureAuth() {
+  if (localStorage.getItem("demo_token")) return;
+
+  let email = localStorage.getItem("demo_email");
+  let password = localStorage.getItem("demo_password");
+  if (!email) {
+    email = "demo-" + Math.random().toString(36).slice(2, 10) + "@example.com";
+    password = Math.random().toString(36).slice(2, 12);
+    localStorage.setItem("demo_email", email);
+    localStorage.setItem("demo_password", password);
+    await api("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) });
+  }
+
+  const form = new URLSearchParams();
+  form.set("username", email);
+  form.set("password", password);
+  const res = await fetch(API + "/auth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  });
+  if (!res.ok) throw new Error("Could not sign in the demo account.");
+  const data = await res.json();
+  localStorage.setItem("demo_token", data.access_token);
+}
+
+async function ensureContent() {
+  let id = localStorage.getItem("demo_content_id");
+  if (id) return id;
+  const content = await api("/content", {
+    method: "POST",
+    body: JSON.stringify({ title: "Demo content", body: "" }),
+  });
+  localStorage.setItem("demo_content_id", content.id);
+  return content.id;
+}
+
+async function withAuthRetry(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    // Token likely expired — clear it and try once more with a fresh login.
+    localStorage.removeItem("demo_token");
+    localStorage.removeItem("demo_content_id");
+    await ensureAuth();
+    return await fn();
+  }
+}
+
+els.draftBtn.addEventListener("click", async () => {
+  const prompt = els.prompt.value.trim();
+  if (!prompt) {
+    setStatus(els.draftStatus, "Type something for the AI to write about first.", "error");
+    return;
+  }
+  els.draftBtn.disabled = true;
+  setStatus(els.draftStatus, "Asking the AI to draft this...", "loading");
+  try {
+    await withAuthRetry(async () => {
+      await ensureAuth();
+      const contentId = await ensureContent();
+      const result = await api(`/content/${contentId}/generate`, {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      });
+      els.body.value = result.output;
+    });
+    setStatus(els.draftStatus, "Draft ready below — edit it if you like.", "success");
+  } catch (err) {
+    setStatus(els.draftStatus, "Couldn't draft that: " + err.message, "error");
+  } finally {
+    els.draftBtn.disabled = false;
+  }
+});
+
+els.speakBtn.addEventListener("click", async () => {
+  const body = els.body.value.trim();
+  if (!body) {
+    setStatus(els.speakStatus, "There's no content to speak yet — write or draft something first.", "error");
+    return;
+  }
+  els.speakBtn.disabled = true;
+  els.player.style.display = "none";
+  setStatus(els.speakStatus, "Generating speech...", "loading");
+  try {
+    await withAuthRetry(async () => {
+      await ensureAuth();
+      const contentId = await ensureContent();
+      await api(`/content/${contentId}`, { method: "PATCH", body: JSON.stringify({ body }) });
+      const result = await api(`/content/${contentId}/speech`, {
+        method: "POST",
+        body: JSON.stringify({ language: els.language.value }),
+      });
+      els.player.src = result.audio_url;
+      els.player.style.display = "block";
+      els.player.play().catch(() => {});
+    });
+    setStatus(els.speakStatus, "Done — playing below.", "success");
+  } catch (err) {
+    setStatus(els.speakStatus, "Couldn't generate speech: " + err.message, "error");
+  } finally {
+    els.speakBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

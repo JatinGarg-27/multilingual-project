@@ -883,3 +883,154 @@ Not applicable — no changes were made, only verification.
 > The previous state left this as an explicit open risk in DECISION-004, since the AI itself has no way to call OpenAI's API.  
 > The new state is that the LLM half of the "Integrating an LLM API to draft and refine content, paired with a TTS API..." resume bullet is now genuinely, functionally true — not just architecturally true.  
 > The TTS half (ElevenLabs) still relies on the DECISION-004 mocked-test verification rather than a live confirmation in this session, which is noted as the one remaining loose end rather than silently assumed to also be working.
+
+---
+
+## DECISION-006 — Add an interactive demo page; fix a stub-mode env bug and a crash-on-provider-error bug found while testing it
+
+**Date:** 2026-08-19  
+**Status:** Accepted  
+**Type:** Feature / Bug Fix
+
+### 1. Trigger
+
+User requirement: a non-technical user should be able to type text and get speech back without knowing what a REST API, JWT, or Swagger UI is. Building and live-testing this surfaced two real, previously-unnoticed bugs.
+
+### 2. Problem
+
+1. No consumer-facing UI existed — the only way to use the backend was the Swagger `/docs` page, which requires understanding auth tokens, path parameters, and JSON bodies.
+2. While live-testing the new page, `POST /generate` returned the stub placeholder even though a real `OPENAI_API_KEY` had supposedly been added and DECISION-005 recorded it as working. Investigating found `services/generation_service/.env` still had the **old** variable names (`LLM_API_KEY`, `LLM_API_BASE_URL`, `LLM_MODEL`) from before DECISION-004 renamed them to `OPENAI_API_KEY`/`OPENAI_BASE_URL`/`OPENAI_MODEL`. Pydantic-settings silently ignores unrecognised env vars (`extra="ignore"`), so the real key was present in the file but never actually read — `openai_api_key` stayed empty, and the service silently stayed in stub mode. The same mistake was present in `services/tts_service/.env` (`TTS_API_KEY` instead of `ELEVENLABS_API_KEY`).
+3. Once the key was actually being read, calling `/generate` through content-service crashed with a raw `500 Internal Server Error` instead of a clean message, because `generation_client.py`/`tts_client.py` called `response.raise_for_status()` with no surrounding `try/except` — an `httpx.HTTPStatusError` from a 502 response propagated all the way up as an unhandled exception.
+
+### 3. Previous Implementation
+
+No `static/` page or `/demo` route existed. `generation_client.py`/`tts_client.py` had no error handling around their `httpx` calls (shown in full in DECISION-004/005). `.env` files for both provider services had stale variable names left over from before DECISION-004.
+
+### 4. Decision
+
+- Added `services/content_service/static/index.html`: a single dependency-free HTML/CSS/JS page — no build step, no framework. On first load it silently registers and logs in a random demo account (stored in `localStorage`), so the person using it never sees auth. It offers: an optional "draft with AI" step (calls `/generate`), an editable text box, a language dropdown for the six supported languages, and a "Convert to speech" button (calls `/speech`) that plays the result in an `<audio>` element.
+- Mounted it in `content_service/app/main.py` via `StaticFiles(directory=..., html=True)` at `/demo`, so it's served same-origin by content-service itself — no CORS configuration needed, and no separate server to run.
+- Fixed the two stale `.env` files (renamed the variables in place; did not touch the actual key values).
+- Rewrote `generation_client.py` and `tts_client.py` to wrap every `httpx` call in `try/except`, turning both `httpx.HTTPStatusError` (peer returned an error status) and `httpx.RequestError` (peer unreachable) into a clean `HTTPException(502, detail=...)` instead of letting either crash into a generic 500.
+
+### 5. Why This Decision?
+
+- A static page served by content-service itself is the simplest possible "interactive tool" — no new service, no new deploy step, no CORS setup, and it exercises the exact same API a real client would use.
+- The env-var bug had to be root-caused, not worked around — the symptom (stub output) looked identical to "no key configured," which is exactly why it went unnoticed in DECISION-005. The fix is data (the `.env` files), not code — the config classes already expect the correct names.
+- Clean error propagation matters specifically because this page is meant for non-technical users — a raw `500 Internal Server Error` with no explanation is far worse for that audience than a real API client, where a developer can go read the logs.
+
+### 6. Alternatives Considered
+
+#### Alternative A
+
+**Approach:**  
+Build a separate small frontend service (its own container, its own port) instead of a static page inside content-service.
+
+**Why rejected:**  
+Adds a fourth service, a fourth Dockerfile, and a CORS configuration for zero real benefit — this page has no build step and no reason to scale or deploy independently of the API it talks to.
+
+#### Alternative B
+
+**Approach:**  
+Leave the raw 500 error as-is, since it's arguably "honest" that something broke.
+
+**Why rejected:**  
+The whole point of this page is to be usable by someone who doesn't know what a stack trace is. A clear "here's what the provider said" message is strictly more useful than an opaque crash, and this matches how generation-service/tts-service already handle their own upstream provider errors (DECISION-004).
+
+### 7. Files Modified
+
+| File | Change | Reason |
+|---|---|---|
+| `services/content_service/static/index.html` | Added | The interactive demo page |
+| `services/content_service/app/main.py` | Mounted `StaticFiles` at `/demo` | Serve the page same-origin, no CORS needed |
+| `services/content_service/app/services/generation_client.py` | Wrapped calls in try/except → clean `HTTPException(502)` | Was crashing to a raw 500 on any peer error |
+| `services/content_service/app/services/tts_client.py` | Same, plus refactored the shared 400→`UnsupportedLanguageError` logic into `_handle_error_response()` | Same reason |
+| `services/generation_service/.env` (local, git-ignored) | Renamed `LLM_API_KEY`→`OPENAI_API_KEY`, `LLM_API_BASE_URL`→`OPENAI_BASE_URL`, `LLM_MODEL`→`OPENAI_MODEL` | Was silently causing stub-mode despite a real key being present |
+| `services/tts_service/.env` (local, git-ignored) | Renamed `TTS_API_KEY`→`ELEVENLABS_API_KEY`, `TTS_API_BASE_URL`→`ELEVENLABS_BASE_URL` | Same reason |
+
+### 8. Dependencies / Configuration
+
+```text
+Added: (none — the demo page is vanilla HTML/CSS/JS, no npm/build tooling)
+Removed: (none)
+Environment variables: no new variable names introduced; two local .env
+  files (not committed) were corrected to use the variable names that
+  have existed since DECISION-004.
+Configuration: (none)
+```
+
+### 9. Result
+
+```text
+Test:
+1. pytest for content_service: 5 passed (unaffected by the client
+   rewrites — tests mock the client methods directly, not httpx).
+2. Rebuilt content-service via `docker compose up -d --build
+   content-service`; confirmed GET /demo/ returns 200 against the
+   real running stack (not TestClient — the actual Docker container).
+3. Drove the page through a real browser (via the Browser pane):
+   typed a prompt, clicked "Draft with AI" — before the .env fix,
+   this produced `[stub output — no OPENAI_API_KEY set]`; recreated
+   generation-service/tts-service after fixing the .env files and
+   confirmed via `docker exec ... echo ${#OPENAI_API_KEY}` that both
+   containers now see a non-empty key.
+4. Re-ran the same click-through. Result: no crash, no stub text —
+   generation-service made a real call to OpenAI and got back a real
+   HTTP error, which content-service now surfaces cleanly as:
+     "generation-service error: ... insufficient_quota ..."
+   Verified directly against generation-service too
+   (curl -X POST :8001/generate) — same error, confirming this is
+   OpenAI's real response, not a bug in this codebase.
+5. Same pattern for tts-service via the "Convert to speech" button
+   and a direct curl to :8002/synthesize — ElevenLabs returned a
+   real 402 "paid_plan_required: Free users cannot use library
+   voices via the API," surfaced cleanly rather than crashing.
+
+Expected:
+The demo page either produces real generated text/audio, or — if a
+provider account can't currently serve the request — a clean,
+readable error explaining why, with no crash.
+
+Actual:
+Exactly that. Both integrations are proven to reach the real
+providers and handle real error responses correctly. Neither
+provider account currently has the plan/billing needed to return a
+successful response:
+  - OpenAI: "insufficient_quota" — needs a payment method added at
+    platform.openai.com/account/billing
+  - ElevenLabs: "paid_plan_required" for library/premade voices via
+    the API (the default voice this project uses) — needs a paid
+    plan, or a self-created/cloned voice instead of a library voice
+
+Status:
+PASS for the demo page and both bug fixes. NOT YET PASS for actually
+hearing real generated speech end-to-end — that is now blocked
+purely on provider account billing/plan, not on anything in this
+codebase.
+```
+
+### 10. Trade-offs / Risks
+
+- **This casts doubt on DECISION-005's recorded result.** DECISION-005 recorded that the user observed real OpenAI output via the live stack. Given the env-var bug just found would have made that response `[stub output — no OPENAI_API_KEY set]\n<prompt>` — text that is superficially plausible if not read closely — it's more likely DECISION-005 actually observed stub output and mistook it for a real response, rather than that the key briefly worked and then this file reverted itself. This is recorded here rather than silently editing DECISION-005, per this file's own append-only, never-delete-a-past-decision rule. DECISION-005's test steps (register/login/create content/generate returning 200) were genuinely real and correctly verified — only the specific claim "real generated output was returned" is now in doubt.
+- The demo page's auto-created account is stored in plaintext in `localStorage` with a randomly generated password — fine for a local demo tool, not a pattern to reuse for anything user-facing.
+- Provider billing status can change at any time (independent of this codebase) — this entry's PASS/FAIL split will go stale the moment the user adds OpenAI billing or an ElevenLabs plan; that follow-up verification is on the user, not the AI, since it requires an account action neither this project nor the AI can perform.
+
+### 11. Rollback
+
+```text
+Revert:
+- Remove services/content_service/static/ and the StaticFiles mount
+  in app/main.py
+- Restore generation_client.py/tts_client.py to their DECISION-004
+  versions (no try/except wrapping)
+- The .env variable-name fixes are not part of the commit (git-ignored
+  local files) — no code rollback needed for those
+- Revert commit: (see git log after this entry's commit)
+```
+
+### 12. AI Reasoning Summary
+
+> The AI made this change because the user wanted a way for a non-technical person to use the backend without knowing what an API is.  
+> The previous implementation had no such interface, and — unrelated to that request, but discovered while testing it — two real bugs: a stale-env-var bug that silently kept both provider integrations in stub mode despite real keys being present, and a crash-instead-of-clean-error bug when a peer service failed.  
+> The new implementation is a same-origin static demo page, plus both bugs fixed and verified with real requests against the real running Docker stack and real provider APIs (not mocks).  
+> This was preferred over a separate frontend service (unjustified complexity) or leaving the crash as-is (actively bad for a non-technical audience) — and the likely-incorrect DECISION-005 result was flagged rather than quietly left standing, per this file's own honesty rules.
