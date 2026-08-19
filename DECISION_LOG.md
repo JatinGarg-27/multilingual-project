@@ -790,3 +790,96 @@ Revert:
 > The previous implementation called a fictional generic API contract that no real provider actually implements, so nothing real was ever generated.  
 > The new implementation calls each provider's actual documented API, handles their real response shapes (including ElevenLabs returning raw audio bytes instead of a URL, which required adding local file storage + static serving), and fails cleanly (502) instead of crashing when a provider errors.  
 > This was preferred over staying generic (doesn't satisfy the user's explicit request) or silently picking different providers (the user was asked and chose these two) — and the discovered Telugu/Kannada coverage gap was documented rather than hidden, per this file's own honesty rules, since it directly affects whether the resume's claim is fully accurate.
+
+---
+
+## DECISION-005 — Confirm real OpenAI integration works via live docker compose stack
+
+**Date:** 2026-08-18  
+**Status:** Accepted  
+**Type:** Testing
+
+### 1. Trigger
+
+DECISION-004 explicitly left "an actual live call to OpenAI's or ElevenLabs' real API" as unverified, since the AI has no API keys or internet access to either provider. User added their own `OPENAI_API_KEY` to `services/generation_service/.env`, rebuilt the docker compose stack, and drove the flow through `content-service`'s Swagger UI (`/docs`) by hand: registered a user, logged in, authorized, created a content item, then called `POST /api/v1/content/{id}/generate`.
+
+### 2. Problem
+
+Whether `generation_service`'s real OpenAI Chat Completions request (added in DECISION-004) actually works against the live API — correct auth header, correct model name, correct response parsing — was unconfirmed.
+
+### 3. Previous Implementation
+
+Same code as DECISION-004; only verified previously via mocked `httpx.post` calls in unit tests, never a real network call to `api.openai.com`.
+
+### 4. Decision
+
+No code change. User confirmed, via the live Swagger UI against the running docker compose stack, that `POST /api/v1/content/{content_id}/generate` returned a real generated response (no longer the `[stub output — no OPENAI_API_KEY set]` placeholder) after adding a real `OPENAI_API_KEY`.
+
+### 5. Why This Decision?
+
+Closes the single largest open risk flagged in DECISION-004 — whether the OpenAI integration code, written against documented API conventions without the ability to test it live, actually works. It does.
+
+### 6. Alternatives Considered
+
+Not applicable — verification step, not a design choice.
+
+### 7. Files Modified
+
+None (verification only). `services/generation_service/.env` was edited by the user locally to add their real key — that file is git-ignored and was never part of a commit.
+
+### 8. Dependencies / Configuration
+
+```text
+Added: (none)
+Removed: (none)
+Environment variables: user populated OPENAI_API_KEY in their local,
+  git-ignored services/generation_service/.env (not committed)
+Configuration: (none)
+```
+
+### 9. Result
+
+```text
+Test:
+Live end-to-end flow through the running docker compose stack via
+content-service's Swagger UI (http://localhost:8000/docs):
+  1. POST /api/v1/auth/register — 201 (or 400 "already registered"
+     on a repeat run, confirming Postgres persistence across restarts)
+  2. POST /api/v1/auth/token — 200, real JWT returned
+  3. POST /api/v1/content — 201, real UUID id, correct owner_id
+  4. GET  /api/v1/content/{id} — 200, correct data returned
+  5. POST /api/v1/content/{id}/generate — real generated output,
+     not the stub placeholder, confirming generation-service's live
+     call to OpenAI succeeded end-to-end (content-service ->
+     generation-service -> OpenAI -> back through both services ->
+     persisted to generation_history)
+
+Expected:
+Real AI-generated text in the "output" field instead of
+"[stub output — no OPENAI_API_KEY set]".
+
+Actual:
+Confirmed by user: real generated output returned, no stub text,
+no errors.
+
+Status:
+PASS. OpenAI integration verified live, not just via mocks.
+```
+
+### 10. Trade-offs / Risks
+
+- `POST /api/v1/content/{id}/speech` (the ElevenLabs path) was not independently re-confirmed live in this same session — it shares the same request/response handling pattern that was verified via mocked tests in DECISION-004, and the underlying mechanism (file write + static serving) is lower-risk than the LLM call, but it has not been clicked through the live Swagger UI the way `/generate` was. Worth a quick follow-up check.
+- The exact generated text was not captured/logged verbatim (the user reported success rather than pasting the full response body) — this entry records that verification happened and passed, not the literal output content.
+
+### 11. Rollback
+
+```text
+Not applicable — no changes were made, only verification.
+```
+
+### 12. AI Reasoning Summary
+
+> The AI logged this because the user confirmed, through the live running stack, that generation-service's real OpenAI integration works end-to-end.  
+> The previous state left this as an explicit open risk in DECISION-004, since the AI itself has no way to call OpenAI's API.  
+> The new state is that the LLM half of the "Integrating an LLM API to draft and refine content, paired with a TTS API..." resume bullet is now genuinely, functionally true — not just architecturally true.  
+> The TTS half (ElevenLabs) still relies on the DECISION-004 mocked-test verification rather than a live confirmation in this session, which is noted as the one remaining loose end rather than silently assumed to also be working.
