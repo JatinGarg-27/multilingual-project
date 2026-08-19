@@ -23,5 +23,9 @@ docker compose up --build
 
 This starts Postgres, `generation-service` (:8001), `tts-service` (:8002), and `content-service` (:8000, the public API — docs at `/docs`). Copy each service's `.env.example` to `.env` first, and fill in `OPENAI_API_KEY` (generation_service) and `ELEVENLABS_API_KEY` (tts_service) to get real output instead of stub responses.
 
+## Try it without an API client
+
+`http://localhost:8000/demo/` is a small interactive page — draft content with AI, edit it, pick a language, and hear it spoken back — for anyone who'd rather not use `/docs` directly. Auth is handled silently in the background.
+
 ## Decision log
 Every significant architectural or AI-driven change is recorded in [DECISION_LOG.md](DECISION_LOG.md).
