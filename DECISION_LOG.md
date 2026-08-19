@@ -1034,3 +1034,177 @@ Revert:
 > The previous implementation had no such interface, and — unrelated to that request, but discovered while testing it — two real bugs: a stale-env-var bug that silently kept both provider integrations in stub mode despite real keys being present, and a crash-instead-of-clean-error bug when a peer service failed.  
 > The new implementation is a same-origin static demo page, plus both bugs fixed and verified with real requests against the real running Docker stack and real provider APIs (not mocks).  
 > This was preferred over a separate frontend service (unjustified complexity) or leaving the crash as-is (actively bad for a non-technical audience) — and the likely-incorrect DECISION-005 result was flagged rather than quietly left standing, per this file's own honesty rules.
+
+---
+
+## DECISION-007 — Replace OpenAI and ElevenLabs with free providers (Google Gemini, gTTS)
+
+**Date:** 2026-08-19  
+**Status:** Accepted  
+**Type:** Dependency / Architecture
+
+### 1. Trigger
+
+User requirement: "I want it to be free as prototype not something to deploy." DECISION-006 established that both existing providers were reachable and integrated correctly, but blocked on account billing: OpenAI returned `insufficient_quota` (no payment method on the account) and ElevenLabs returned `paid_plan_required` (the free tier blocks API access to library voices, which is what this project used). Neither is fixable without spending money.
+
+### 2. Problem
+
+A prototype that requires the owner to pay a provider before it produces any real output doesn't meet "free as prototype." Needed genuinely free replacements for both the LLM and TTS integrations — free tier with no card required for the LLM, and free with no account at all if possible for TTS, without regressing language coverage or code quality.
+
+### 3. Previous Implementation
+
+`generation_service` called OpenAI's Chat Completions API (`Authorization: Bearer`, model `gpt-4o-mini`). `tts_service` called ElevenLabs' text-to-speech API (`xi-api-key` header, `eleven_multilingual_v2` model), which also does not officially support Telugu or Kannada (DECISION-004).
+
+### 4. Decision
+
+Asked the user to choose between concrete free options for each half, rather than picking unilaterally, since both are real provider swaps with trade-offs. User chose:
+
+- **LLM: Google Gemini** (`generativelanguage.googleapis.com`, free tier via Google AI Studio, no card required). `generation_service/app/main.py` and `app/config.py` rewritten: `POST {base}/{model}:generateContent?key={GEMINI_API_KEY}` with body `{"contents": [{"parts": [{"text": prompt}]}]}`, parses `candidates[0].content.parts[0].text`. Config renamed `OPENAI_*` → `GEMINI_API_KEY`/`GEMINI_BASE_URL`/`GEMINI_MODEL` (default `gemini-2.0-flash`).
+- **TTS: gTTS** (Google Translate's text-to-speech, via the `gTTS` PyPI package — not an HTTP API called with `httpx`, a Python library that internally handles the request to Google Translate). `tts_service/app/main.py` rewritten: `_call_gtts(text, language)` uses `gTTS(text=text, lang=language).write_to_fp()` to get raw MP3 bytes, which are written to `audio_output/` and served exactly as before via the existing `/audio` static mount. No API key of any kind is needed — `ELEVENLABS_*` config removed entirely. `voice_id` is kept in the request/response schemas (unused) purely so `content_service`'s existing client code needed zero changes.
+- **Verified all six required languages actually work with gTTS before committing to it** — ran `gTTS(text=..., lang=lang)` directly for `de/fr/es/ta/te/kn` and got real MP3 bytes back for every one. This is a genuine improvement over ElevenLabs: gTTS supports Telugu and Kannada, which ElevenLabs did not (DECISION-004's documented gap is resolved by this swap, not just worked around).
+
+### 5. Why This Decision?
+
+- Google Gemini's free tier (via AI Studio, not Vertex AI) does not require a credit card to obtain a key, unlike OpenAI, which requires billing details even to use its cheapest model.
+- gTTS requires no signup at all, which is the strongest possible "free as prototype" answer for TTS, and its language coverage happens to be a strict improvement over the previous provider for this specific project's requirements.
+- Kept the exact same internal contracts (`SynthesizeRequest`/`SynthesizeOut`, `/languages`, `/voices/{language}`, the `/audio` static-file mechanism, and every content-service-facing interface) so this is a contained swap inside two files per service, not a redesign — `content_service` needed no changes at all.
+
+### 6. Alternatives Considered
+
+#### Alternative A
+
+**Approach:**  
+For LLM: Groq (free, no card, open models like Llama 3, very fast).
+
+**Why rejected:**  
+Not rejected on merit — presented as an equal option and the user chose Gemini instead. Groq remains a reasonable future alternative if Gemini's free tier ever becomes insufficient.
+
+#### Alternative B
+
+**Approach:**  
+For TTS: keep ElevenLabs, but have the user create their own voice in ElevenLabs' Voice Lab, since the free-tier restriction is specifically on shared library voices, not self-created ones.
+
+**Why rejected:**  
+Not rejected on merit either — presented as an option and the user chose gTTS instead, since it requires zero setup and is unambiguously free, whereas the ElevenLabs-free-tier-with-own-voice path was explicitly caveated as "not guaranteed free."
+
+#### Alternative C
+
+**Approach:**  
+Self-host an open-source TTS model (e.g. Coqui TTS) instead of calling any external service.
+
+**Why rejected:**  
+Not presented to the user — would add a heavy dependency (model weights, GPU/CPU inference cost, longer container build/startup) for a "prototype, not something to deploy," where gTTS's simplicity is a better fit than owning a model.
+
+### 7. Files Modified
+
+| File | Change | Reason |
+|---|---|---|
+| `services/generation_service/app/config.py` | `OPENAI_*` → `GEMINI_API_KEY`/`GEMINI_BASE_URL`/`GEMINI_MODEL` | Match Gemini's real config |
+| `services/generation_service/app/main.py` | Real Gemini `generateContent` request/response handling | Was calling OpenAI |
+| `services/generation_service/.env.example` | Real Gemini key name + free-tier signup URL | Match new config |
+| `services/generation_service/tests/test_generation.py` | Rewrote the 2 "configured" tests to assert the exact Gemini URL/params/body | Prove request-building logic without a real key |
+| `services/tts_service/requirements.txt` | Added `gTTS==2.5.4` | New dependency |
+| `services/tts_service/app/config.py` | Removed all `ELEVENLABS_*`/API-key settings; kept `PUBLIC_BASE_URL`, `supported_languages` | gTTS needs no provider config |
+| `services/tts_service/app/main.py` | Replaced `_call_elevenlabs` (httpx call) with `_call_gtts` (gTTS library call); `voice_id` now unused but kept in the schema for compatibility | ElevenLabs → gTTS |
+| `services/tts_service/.env.example` | Removed key requirement entirely; only `PUBLIC_BASE_URL` remains | gTTS needs no key |
+| `services/tts_service/tests/test_tts.py` | Rewrote to mock `_call_gtts` directly (no more httpx mocking); added a dedicated Telugu/Kannada test | Match the new integration; explicitly prove the previously-documented gap is now closed |
+| `CLAUDE.md`, `README.md` | Name the real providers now in use, point at the free-tier signup URL | Match actual implementation |
+
+### 8. Dependencies / Configuration
+
+```text
+Added:
+- gTTS==2.5.4 (tts_service only)
+
+Removed:
+- (no packages removed — ElevenLabs/OpenAI were called via httpx,
+  which both services still use elsewhere; no OpenAI/ElevenLabs SDK
+  had been added, so there's nothing to uninstall)
+
+Environment variables:
+- generation_service: removed OPENAI_API_KEY/OPENAI_BASE_URL/OPENAI_MODEL;
+  added GEMINI_API_KEY, GEMINI_BASE_URL, GEMINI_MODEL
+- tts_service: removed ELEVENLABS_API_KEY/ELEVENLABS_BASE_URL/
+  ELEVENLABS_MODEL_ID/DEFAULT_VOICE_ID entirely; only PUBLIC_BASE_URL
+  remains
+
+Configuration:
+- docker-compose.yml: no changes needed (env_file paths unchanged)
+```
+
+### 9. Result
+
+```text
+Test:
+1. Verified gTTS covers all six required languages BEFORE writing any
+   integration code: ran gTTS directly for de/fr/es/ta/te/kn, got real
+   MP3 bytes back for every one (19-22KB each).
+2. pytest, all three services: generation_service 5 passed, tts_service
+   8 passed (including a new dedicated Telugu/Kannada test), content_service
+   5 passed (unaffected — client method signatures didn't change).
+3. Rebuilt generation-service and tts-service via
+   `docker compose up -d --build generation-service tts-service`
+   against the real running stack.
+4. Live-tested tts-service directly (curl to :8002/synthesize) in
+   Tamil, German, and Kannada. Downloaded and inspected the returned
+   audio file: a real 28KB MPEG Layer III MP3, playable, not a stub.
+   (One Kannada-script curl attempt failed with "No text to send to
+   TTS API" -- traced to a shell/terminal encoding issue with typing
+   Kannada Unicode directly into a curl command, not a real language
+   bug; a follow-up call with plain-ASCII text and lang=kn succeeded,
+   confirming the pipeline itself works for that language code.)
+5. Live-tested the actual /demo page end-to-end through a real browser
+   (not curl): typed text, selected Spanish, clicked "Convert to
+   speech" -- got back a real playable audio URL and "Done — playing
+   below," confirmed via the page's own JS state, not assumed.
+6. generation-service correctly still returns the stub response
+   ("[stub output — no GEMINI_API_KEY set]") since no real
+   GEMINI_API_KEY has been added yet -- this is the expected,
+   correct behavior for an unconfigured key, not a bug.
+
+Expected:
+TTS produces real, playable audio for all six languages with zero
+cost and zero signup. LLM produces real drafted text once a free
+Gemini key is added, and a clear stub otherwise.
+
+Actual:
+Exactly that, confirmed by direct provider calls, the full test
+suite, and a real click-through of the live page. TTS half is fully
+working right now. LLM half needs the user to grab a free key from
+Google AI Studio -- no further code changes required for that.
+
+Status:
+PASS for TTS (verified live, real audio, zero cost). PASS for the
+integration code correctness of the LLM half (request construction
+verified by mocked tests, matches Gemini's documented API). NOT YET
+verified against a live Gemini key, since none is available in this
+environment -- same category of gap as every previous "no credentials
+available to the AI" caveat in this log.
+```
+
+### 10. Trade-offs / Risks
+
+- **gTTS is an unofficial use of Google Translate's TTS endpoint**, not a documented, versioned, guaranteed-stable API — Google could change or rate-limit it without notice. Acceptable for "a prototype, not something to deploy," explicitly called out here so it isn't mistaken for a production-grade commitment later.
+- **Audio quality is lower than ElevenLabs** — gTTS is a straightforward text-to-speech pass, not natural-sounding neural voice synthesis. A reasonable trade for zero cost in a prototype; would be worth revisiting for a real deployment.
+- **No voice selection** — gTTS has no concept of multiple voices/accents per language, unlike ElevenLabs. `voice_id` remains in the API for compatibility but does nothing.
+- **Gemini's free tier has rate limits** (requests per minute per model) that a paid OpenAI/Gemini tier wouldn't have — fine for prototype/demo use, would need attention before any real traffic.
+- **This is the third provider swap in this project's history** (generic stub → OpenAI/ElevenLabs in DECISION-004 → Gemini/gTTS here). The provider-agnostic HTTP-client-style abstraction from earlier decisions made each swap contained to 2 files per service rather than a wider refactor — validates that earlier architectural choice.
+
+### 11. Rollback
+
+```text
+Revert:
+- Restore services/generation_service/app/{main,config}.py and
+  services/tts_service/app/{main,config}.py from the DECISION-006
+  commit (back to OpenAI/ElevenLabs)
+- Restore the corresponding .env.example and requirements.txt files
+- Remove the gTTS dependency
+- Revert commit: (see git log after this entry's commit)
+```
+
+### 12. AI Reasoning Summary
+
+> The AI made this change because the user explicitly wants a free prototype, and both previous providers require paid billing to actually produce output, discovered and proven in DECISION-006.  
+> The previous implementation was correctly integrated but functionally blocked on account billing for both LLM and TTS.  
+> The new implementation uses Google Gemini's genuinely free, no-card tier for LLM, and gTTS's genuinely free, no-account TTS — verified live for TTS (real audio, real languages including the two ElevenLabs couldn't cover) and verified for correctness (not yet live) for LLM, since no Gemini key was available to the AI.  
+> This was preferred over Groq or an ElevenLabs-own-voice workaround (both reasonable, but the user chose Gemini/gTTS when given the choice) because it is the most unambiguously free path for both halves, with the added benefit of genuinely fixing the Telugu/Kannada gap rather than just working around it.

@@ -12,8 +12,8 @@ Structured with a modular, microservice-oriented architecture so generation, TTS
 
 ## Providers
 
-- LLM: OpenAI (Chat Completions)
-- TTS: ElevenLabs — note: Telugu and Kannada are accepted by the API but not officially supported by ElevenLabs' multilingual model; see DECISION-004 in [DECISION_LOG.md](DECISION_LOG.md).
+- LLM: Google Gemini — free tier, no card required. Get a key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+- TTS: gTTS (Google Translate TTS) — completely free, no API key or account needed, and genuinely covers all six languages including Telugu and Kannada. See DECISION-007 in [DECISION_LOG.md](DECISION_LOG.md) for why this replaced OpenAI/ElevenLabs.
 
 ## Running locally
 
@@ -21,7 +21,7 @@ Structured with a modular, microservice-oriented architecture so generation, TTS
 docker compose up --build
 ```
 
-This starts Postgres, `generation-service` (:8001), `tts-service` (:8002), and `content-service` (:8000, the public API — docs at `/docs`). Copy each service's `.env.example` to `.env` first, and fill in `OPENAI_API_KEY` (generation_service) and `ELEVENLABS_API_KEY` (tts_service) to get real output instead of stub responses.
+This starts Postgres, `generation-service` (:8001), `tts-service` (:8002), and `content-service` (:8000, the public API — docs at `/docs`). Copy each service's `.env.example` to `.env` first, and fill in `GEMINI_API_KEY` (generation_service only — tts_service needs no key at all) to get real drafted text instead of stub responses.
 
 ## Try it without an API client
 

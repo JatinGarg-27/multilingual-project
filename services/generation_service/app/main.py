@@ -1,4 +1,4 @@
-"""generation-service — owns the LLM API integration (OpenAI Chat Completions).
+"""generation-service — owns the LLM API integration (Google Gemini, free tier).
 
 Independently deployable so it can scale separately from content
 persistence and TTS conversion, and be tested in isolation.
@@ -28,24 +28,19 @@ class GenerationOut(BaseModel):
 
 
 def _configured() -> bool:
-    return bool(settings.openai_api_key)
+    return bool(settings.gemini_api_key)
 
 
 def _call_llm(prompt: str) -> str:
     if not _configured():
-        return f"[stub output — no OPENAI_API_KEY set]\n{prompt}"
+        return f"[stub output — no GEMINI_API_KEY set]\n{prompt}"
 
+    url = f"{settings.gemini_base_url}/{settings.gemini_model}:generateContent"
     try:
         response = httpx.post(
-            settings.openai_base_url,
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.openai_model,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            url,
+            params={"key": settings.gemini_api_key},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=30.0,
         )
         response.raise_for_status()
@@ -56,20 +51,21 @@ def _call_llm(prompt: str) -> str:
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"LLM provider unreachable: {exc}") from exc
 
-    return response.json()["choices"][0]["message"]["content"]
+    data = response.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 @app.post("/generate", response_model=GenerationOut)
 def generate(payload: GenerateRequest) -> GenerationOut:
     output = _call_llm(payload.prompt)
-    return GenerationOut(output=output, model=settings.openai_model)
+    return GenerationOut(output=output, model=settings.gemini_model)
 
 
 @app.post("/refine", response_model=GenerationOut)
 def refine(payload: RefineRequest) -> GenerationOut:
     prompt = f"Refine the following content.\n\nInstructions: {payload.instructions}\n\nContent:\n{payload.content}"
     output = _call_llm(prompt)
-    return GenerationOut(output=output, model=settings.openai_model)
+    return GenerationOut(output=output, model=settings.gemini_model)
 
 
 @app.get("/health")

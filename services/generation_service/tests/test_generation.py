@@ -30,19 +30,19 @@ def test_refine_returns_stub_when_unconfigured():
     assert "hello world" in body["output"]
 
 
-def _fake_openai_response(content: str) -> MagicMock:
+def _fake_gemini_response(text: str) -> MagicMock:
     fake = MagicMock()
     fake.raise_for_status.return_value = None
-    fake.json.return_value = {"choices": [{"message": {"content": content}}]}
+    fake.json.return_value = {"candidates": [{"content": {"parts": [{"text": text}]}}]}
     return fake
 
 
-def test_generate_calls_openai_with_correct_request_when_configured():
+def test_generate_calls_gemini_with_correct_request_when_configured():
     with patch("app.main.settings") as mock_settings, patch("httpx.post") as mock_post:
-        mock_settings.openai_api_key = "sk-test"
-        mock_settings.openai_base_url = "https://api.openai.com/v1/chat/completions"
-        mock_settings.openai_model = "gpt-4o-mini"
-        mock_post.return_value = _fake_openai_response("A generated haiku")
+        mock_settings.gemini_api_key = "gm-test"
+        mock_settings.gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+        mock_settings.gemini_model = "gemini-2.0-flash"
+        mock_post.return_value = _fake_gemini_response("A generated haiku")
 
         response = client.post("/generate", json={"prompt": "Write a haiku"})
 
@@ -50,17 +50,16 @@ def test_generate_calls_openai_with_correct_request_when_configured():
         assert response.json()["output"] == "A generated haiku"
 
         call = mock_post.call_args
-        assert call.args[0] == "https://api.openai.com/v1/chat/completions"
-        assert call.kwargs["headers"]["Authorization"] == "Bearer sk-test"
-        assert call.kwargs["json"]["model"] == "gpt-4o-mini"
-        assert call.kwargs["json"]["messages"] == [{"role": "user", "content": "Write a haiku"}]
+        assert call.args[0] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        assert call.kwargs["params"] == {"key": "gm-test"}
+        assert call.kwargs["json"] == {"contents": [{"parts": [{"text": "Write a haiku"}]}]}
 
 
-def test_generate_returns_502_when_openai_unreachable():
+def test_generate_returns_502_when_gemini_unreachable():
     with patch("app.main.settings") as mock_settings, patch("httpx.post") as mock_post:
-        mock_settings.openai_api_key = "sk-test"
-        mock_settings.openai_base_url = "https://api.openai.com/v1/chat/completions"
-        mock_settings.openai_model = "gpt-4o-mini"
+        mock_settings.gemini_api_key = "gm-test"
+        mock_settings.gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/models"
+        mock_settings.gemini_model = "gemini-2.0-flash"
         import httpx
 
         mock_post.side_effect = httpx.ConnectError("connection refused")
