@@ -29,7 +29,16 @@ This starts Postgres, `generation-service` (:8001), `tts-service` (:8002), and `
 
 ## Performance
 
-The `generation_history`, `contents`, and `audio_assets` foreign-key columns were unindexed — a common Postgres gotcha, since foreign keys aren't automatically indexed the way primary keys are. Added indexes via an Alembic migration and measured the real effect with `EXPLAIN ANALYZE` against 100,000 seeded rows: the query `next_version()` runs on every `/generate` and `/refine` call dropped from **270.7ms → 0.47ms** (a full table scan replaced by an index lookup, ~578x faster on that sample). Full methodology and raw query output in DECISION-009, [DECISION_LOG.md](DECISION_LOG.md).
+`contents.owner_id`, `generation_history.content_id`, and `audio_assets.content_id` are foreign keys — Postgres indexes primary keys automatically, but not foreign keys, so all three were unindexed. Added indexes via an Alembic migration ([`0002_add_foreign_key_indexes.py`](services/content_service/alembic/versions/0002_add_foreign_key_indexes.py)) and measured the real effect with `EXPLAIN ANALYZE` against 100,000 seeded rows in a live Postgres instance — not estimated.
+
+`next_version()` (called on every `/generate` and `/refine` request) runs `SELECT max(version) FROM generation_history WHERE content_id = ?`:
+
+| Sample | Before (Seq Scan) | After (Index Scan) | Speedup |
+|---|---|---|---|
+| `content_id` with no history yet (first `/generate` call) | 270.7 ms | 0.47 ms | ~578x |
+| `content_id` with existing history | 35.3 ms | 0.40 ms | ~88x |
+
+Both measured with `EXPLAIN (ANALYZE, BUFFERS)` on the exact query the app runs, before and after the index existed, on the same seeded dataset. Methodology, raw query-plan output, and honest caveats about measurement rigor (2 samples on a local machine, not a full statistical benchmark) are in DECISION-009, [DECISION_LOG.md](DECISION_LOG.md).
 
 ## Decision log
 Every significant architectural or AI-driven change is recorded in [DECISION_LOG.md](DECISION_LOG.md).
