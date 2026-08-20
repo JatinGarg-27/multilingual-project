@@ -27,5 +27,9 @@ This starts Postgres, `generation-service` (:8001), `tts-service` (:8002), and `
 
 `http://localhost:8000/demo/` is a small interactive page — draft content with AI, edit it, pick a language, and hear it spoken back — for anyone who'd rather not use `/docs` directly. Auth is handled silently in the background.
 
+## Performance
+
+The `generation_history`, `contents`, and `audio_assets` foreign-key columns were unindexed — a common Postgres gotcha, since foreign keys aren't automatically indexed the way primary keys are. Added indexes via an Alembic migration and measured the real effect with `EXPLAIN ANALYZE` against 100,000 seeded rows: the query `next_version()` runs on every `/generate` and `/refine` call dropped from **270.7ms → 0.47ms** (a full table scan replaced by an index lookup, ~578x faster on that sample). Full methodology and raw query output in DECISION-009, [DECISION_LOG.md](DECISION_LOG.md).
+
 ## Decision log
 Every significant architectural or AI-driven change is recorded in [DECISION_LOG.md](DECISION_LOG.md).

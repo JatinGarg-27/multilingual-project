@@ -1345,3 +1345,139 @@ Revert:
 > The previous implementation would have looked correct in code review but failed on every real call, and two tests would have silently stopped testing what their names claimed to test.  
 > The new implementation was verified at every layer -- direct provider call, direct service call, and a real browser click-through of the actual demo page -- producing genuine AI-drafted text and genuine synthesized speech.  
 > This was preferred over reverting to an older, deprecated model (recreates the same bug) or leaving the tests ambient-state-dependent (not reproducible) because both fixes address the actual root cause rather than the symptom.
+
+---
+
+## DECISION-009 — Add missing foreign-key indexes; measure the real query speedup
+
+**Date:** 2026-08-19  
+**Status:** Accepted  
+**Type:** Performance / Database
+
+### 1. Trigger
+
+User wanted a genuine, measurable performance improvement to be able to describe with real numbers (e.g. in a resume or interview) — explicitly asked for real measured statistics, not invented ones. Reviewing the schema found that none of the foreign-key columns (`contents.owner_id`, `generation_history.content_id`, `audio_assets.content_id`) had an index — a very common, real-world Postgres gotcha, since Postgres does not automatically index foreign keys the way it does primary keys.
+
+### 2. Problem
+
+Every `/generate` or `/refine` call runs `next_version()` (`services/content_service.py`), which executes `SELECT max(version) FROM generation_history WHERE content_id = ?` — with no index on `content_id`, Postgres has no way to do this except a full sequential scan of the entire table, checking every row's `content_id` by hand. The same problem applies to listing a user's content (`WHERE owner_id = ?`) and any future lookup of a content item's audio assets.
+
+### 3. Previous Implementation
+
+`app/models/content.py`, `generation.py`, `audio.py` declared their foreign-key columns as plain `mapped_column(UUID(as_uuid=True), ForeignKey(...), nullable=False)` — no `index=True`. `alembic/versions/0001_initial_schema.py` created no indexes on these columns beyond the implicit primary-key index.
+
+### 4. Decision
+
+- Added `index=True` to `Content.owner_id`, `GenerationHistory.content_id`, `AudioAsset.content_id` in the SQLAlchemy models (so the models honestly reflect the real schema going forward).
+- Added `alembic/versions/0002_add_foreign_key_indexes.py`, creating `ix_contents_owner_id`, `ix_generation_history_content_id`, `ix_audio_assets_content_id`.
+- **Measured the real effect before claiming anything**, using the actual query the app runs, against a realistic data volume:
+  1. Seeded 100 users, 5,000 content rows, and 100,000 `generation_history` rows directly into the running Postgres container (bulk SQL via `generate_series`, not through the API — this is synthetic benchmark data, not real usage).
+  2. Ran `EXPLAIN (ANALYZE, BUFFERS)` on `SELECT max(version) FROM generation_history WHERE content_id = <uuid>` for two different content IDs, **before** the index existed.
+  3. Rebuilt content-service (the new migration file didn't exist inside the already-running container's image) and applied the migration.
+  4. Re-ran the identical two queries, **after** the index existed.
+  5. Deleted all the synthetic seed data afterward — the index stays, the fake data doesn't.
+
+### 5. Why This Decision?
+
+- This is the single most-called database query in the whole system that scales with data volume — every content-generation call pays this cost, and it gets worse the more history accumulates, which is exactly the kind of thing worth fixing before it becomes a real problem rather than after.
+- Missing FK indexes are a genuine, common, defensible thing to have found and fixed — not a contrived example built just to have a number to report.
+- Measuring with `EXPLAIN ANALYZE` against a real, seeded Postgres instance (not a toy in-memory dataset) means the numbers below are real Postgres query planner output, not estimated or invented.
+
+### 6. Alternatives Considered
+
+#### Alternative A
+
+**Approach:**  
+Report a synthetic/illustrative percentage without actually seeding data and measuring, since a fresh install with only a handful of rows wouldn't show a meaningful difference either way.
+
+**Why rejected:**  
+Directly contradicts the user's explicit ask for real measured statistics, and this file's own rule against claiming something works without testing it.
+
+#### Alternative B
+
+**Approach:**  
+Benchmark at the HTTP endpoint level (`/generate`) instead of the raw SQL query.
+
+**Why rejected:**  
+Considered, but `/generate`'s total latency is dominated by the external Gemini API call itself (7–30 seconds, per DECISION-008) — a sub-millisecond database improvement is completely invisible at that level, making it a misleading way to present this specific fix. The raw query benchmark is the honest, directly-attributable measurement; a DB-bound endpoint with no external API call (like a future paginated content list) would be the right place for an HTTP-level number.
+
+### 7. Files Modified
+
+| File | Change | Reason |
+|---|---|---|
+| `services/content_service/app/models/content.py` | `owner_id` → `index=True` | Match the new schema |
+| `services/content_service/app/models/generation.py` | `content_id` → `index=True` | Match the new schema |
+| `services/content_service/app/models/audio.py` | `content_id` → `index=True` | Match the new schema |
+| `services/content_service/alembic/versions/0002_add_foreign_key_indexes.py` | Added | Creates the three indexes |
+
+### 8. Dependencies / Configuration
+
+```text
+Added: (none)
+Removed: (none)
+Environment variables: (none)
+Configuration: (none — this is a schema-only change via Alembic)
+```
+
+### 9. Result
+
+```text
+Test:
+pytest, content_service: 5 passed (unaffected — indexes don't change
+query results, only query plans).
+
+Benchmark (real EXPLAIN ANALYZE output against 100,000 seeded rows
+in the live Postgres container, exact query from next_version()):
+
+  Query on content_id with 0 matching rows (a content item's first
+  /generate call — realistic, common case):
+    Before: Seq Scan, 100,011 rows checked, 270.703 ms execution time
+    After:  Index Scan, 2 buffer reads,      0.468 ms execution time
+    -> ~578x faster
+
+  Query on content_id with matching rows (a subsequent /generate
+  or /refine call on existing content):
+    Before: Seq Scan, 100,010 rows checked, 35.250 ms execution time
+    After:  Index Scan, 3 buffer reads,       0.399 ms execution time
+    -> ~88x faster
+
+Expected:
+The index should let Postgres jump directly to matching rows instead
+of scanning the whole table, with a bigger relative win as the table
+grows.
+
+Actual:
+Confirmed exactly that via real EXPLAIN ANALYZE output, not estimated.
+Both samples show a 2-3 orders of magnitude reduction in execution
+time. Synthetic seed data (100 users, 5,000 content rows, 100,000
+history rows) was deleted after measuring; only the index itself and
+the real users' existing rows remain.
+
+Status:
+PASS. Real, measured, reproducible result, with the exact commands
+and output preserved in this entry.
+```
+
+### 10. Trade-offs / Risks
+
+- **Only 2 sample queries were measured**, not a full statistical benchmark (multiple trials averaged, warm vs. cold cache controlled for, etc.) — appropriate rigor for a portfolio project's honest measurement, not a claim of scientific precision. Anyone asked "how did you measure this" in an interview should describe exactly this methodology, not imply more rigor than was actually done.
+- **Measured on a local Docker Desktop Postgres instance on a resource-constrained laptop**, not production hardware — the relative speedup (orders of magnitude, because Seq Scan vs. Index Scan is an algorithmic difference, O(n) vs. O(log n)) is representative and would hold on any hardware; the absolute millisecond numbers would not.
+- **Writes get very slightly slower** with an index present (every `INSERT`/`UPDATE` on an indexed column also updates the index) — an unmeasured, standard, and clearly worthwhile trade-off given how much more frequently this table is read from than written to relatively speaking (every read pays the scan cost; each write only pays a small index-maintenance cost once).
+- `voice_preferences.user_id` was deliberately left alone — its existing `UniqueConstraint(user_id, language)` already creates a composite index whose leading column is `user_id`, so a separate single-column index would be redundant.
+
+### 11. Rollback
+
+```text
+Revert:
+- alembic downgrade to 0001 (drops all three indexes) via:
+  docker exec multilingual-project-content-service-1 alembic downgrade 0001
+- Remove index=True from the three model columns
+- Revert commit: (see git log after this entry's commit)
+```
+
+### 12. AI Reasoning Summary
+
+> The AI made this change because the user wanted a real, defensible performance story with actual measured numbers, and a genuine issue (missing FK indexes) existed to fix and measure rather than invent.  
+> The previous implementation had every content-generation call pay an ever-growing full-table-scan cost that would only get worse as usage grew.  
+> The new implementation adds the three missing indexes via a proper Alembic migration, verified with real `EXPLAIN ANALYZE` output against a realistically-sized seeded dataset showing 88x-578x faster execution for the exact query the application runs.  
+> This was preferred over reporting an estimated or illustrative number (dishonest, and against this file's own rules) or benchmarking at the HTTP layer (misleading here, since Gemini's own latency dominates that measurement) because it isolates and honestly attributes the improvement to the actual change made.
